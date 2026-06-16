@@ -1,0 +1,23 @@
+# ── Core framework ────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sse-starlette>=2.1.0
+
+# ── LangGraph + LangChain ─────────────────────────────────────────────────────
+langgraph>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langchain-mcp-adapters>=0.1.0
+
+# ── MCP server ────────────────────────────────────────────────────────────────
+fastmcp>=0.4.0
+mcp>=1.2.0
+
+# ── Search ────────────────────────────────────────────────────────────────────
+duckduckgo-search>=7.0.0
+
+# ── Utils ─────────────────────────────────────────────────────────────────────
+pydantic>=2.9.0
+python-dotenv>=1.0.0
+httpx>=0.28.0

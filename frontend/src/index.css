@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply bg-gray-950 text-gray-100 antialiased;
+    scroll-behavior: smooth;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-gray-900; }
+  ::-webkit-scrollbar-thumb { @apply bg-gray-700 rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-gray-500; }
+}
+
+@layer components {
+  .prose-research {
+    @apply text-gray-200 leading-relaxed;
+  }
+  .prose-research h2 {
+    @apply text-xl font-semibold text-white mt-6 mb-3 pb-2 border-b border-gray-700;
+  }
+  .prose-research h3 {
+    @apply text-lg font-medium text-gray-100 mt-4 mb-2;
+  }
+  .prose-research p {
+    @apply mb-4 text-gray-300;
+  }
+  .prose-research ul {
+    @apply list-disc list-inside mb-4 space-y-1;
+  }
+  .prose-research li {
+    @apply text-gray-300;
+  }
+  .prose-research strong {
+    @apply text-white font-semibold;
+  }
+  .prose-research code {
+    @apply font-mono text-sm bg-gray-800 px-1.5 py-0.5 rounded text-blue-300;
+  }
+  .prose-research blockquote {
+    @apply border-l-4 border-brand-500 pl-4 italic text-gray-400 my-4;
+  }
+}

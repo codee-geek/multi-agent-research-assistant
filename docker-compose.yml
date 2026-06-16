@@ -1,0 +1,67 @@
+version: '3.9'
+
+services:
+
+  # ── MCP Search Server ──────────────────────────────────────────────────────
+  mcp-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python mcp_server.py
+    environment:
+      MCP_SERVER_HOST: "0.0.0.0"
+      MCP_SERVER_PORT: "8001"
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - research-net
+
+  # ── FastAPI Backend ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      MCP_SERVER_URL: "http://mcp-server:8001/sse"
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - research-net
+
+  # ── React Frontend ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - research-net
+
+
+networks:
+  research-net:
+    driver: bridge
