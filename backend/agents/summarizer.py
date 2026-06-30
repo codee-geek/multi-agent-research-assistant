@@ -16,7 +16,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_openai import ChatOpenAI
 
-from models.schemas import ResearchSummary, SearchResult
+from models.schemas import ResearchPlan, ResearchSummary, SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,53 @@ def _get_llm() -> ChatOpenAI:
 async def summarizer_node(state: dict[str, Any]) -> dict[str, Any]:
     """LangGraph node: synthesize search results into a structured summary."""
     query: str = state["query"]
-    results: list[SearchResult] = state["search_results"]
+    results: list[SearchResult] = state.get("search_results") or []
 
     logger.info("[Summarizer] Synthesizing %d sources for %r", len(results), query)
 
+    if not results:
+        retrieved_count = state.get("retrieved_count", 0)
+        if retrieved_count > 0:
+            summary = ResearchSummary(
+                title="Sources filtered out",
+                summary=(
+                    "## No sources passed validation\n\n"
+                    f"The web retriever found **{retrieved_count}** sources, but none were "
+                    "considered relevant enough to the research plan. "
+                    "Try rephrasing your question with a clearer research scope."
+                ),
+                key_findings=[
+                    f"{retrieved_count} sources were retrieved but filtered out during validation.",
+                ],
+            )
+        else:
+            summary = ResearchSummary(
+                title="No sources found",
+                summary=(
+                    "## No results retrieved\n\n"
+                    "The web search did not return any sources for this query. "
+                    "Try rephrasing your question or running the search again."
+                ),
+                key_findings=["No web sources were retrieved for this query."],
+            )
+        return {
+            "summary": summary,
+            "current_step": "citation_formatter",
+            "step_log": state.get("step_log", []) + [{
+                "agent": "summarizer",
+                "output": {"title": summary.title, "key_findings": summary.key_findings, "summary_length": len(summary.summary)},
+            }],
+            "messages": state.get("messages", []) + [AIMessage(content=f"Summary: {summary.title}")],
+        }
+
     formatted = _format_results(results)
+    plan: ResearchPlan | None = state.get("plan")
+    plan_context = ""
+    if plan:
+        plan_context = (
+            f"\nResearch plan reasoning: {plan.reasoning}\n"
+            f"Sub-queries: {', '.join(plan.sub_queries)}\n"
+        )
 
     llm = _get_llm().with_structured_output(ResearchSummary)
 
@@ -79,7 +121,8 @@ async def summarizer_node(state: dict[str, Any]) -> dict[str, Any]:
         SystemMessage(content=_SYSTEM_PROMPT),
         HumanMessage(
             content=(
-                f"Original research question: {query}\n\n"
+                f"Original research question: {query}\n"
+                f"{plan_context}\n"
                 f"Search results ({len(results)} sources):\n\n"
                 f"{formatted}"
             )

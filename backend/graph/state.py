@@ -2,55 +2,67 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
-from langgraph.graph.message import add_messages
+from typing import Annotated, Any, TypedDict
+
 from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
 from models.schemas import (
-    ResearchPlan,
-    SearchResult,
-    ResearchSummary,
     CitationOutput,
+    EvidenceValidation,
+    ResearchPlan,
+    ResearchSummary,
+    SearchResult,
+    SelfReview,
 )
 
 
-class ResearchState(dict):
+class ResearchState(TypedDict, total=False):
     """
-    Typed state dict threaded through the LangGraph pipeline.
+    Typed state threaded through the LangGraph pipeline.
 
-    Fields
-    ------
-    query           : original user query
-    max_sources     : max results per sub-query (from request)
-    plan            : structured research plan (Planner output)
-    search_results  : aggregated search results (Retriever output)
-    summary         : synthesized summary (Summarizer output)
-    citations       : formatted citations (CitationFormatter output)
-    current_step    : human-readable label of the active agent
-    step_log        : ordered list of step metadata for the UI timeline
-    messages        : LangChain message history (add_messages reducer)
-    error           : set if any node raises an unrecoverable error
+    Using TypedDict ensures LangGraph merges partial node updates instead of
+    replacing the entire state dict on each step.
     """
 
-    # We annotate the messages key so LangGraph uses its built-in reducer
-    # (appending rather than overwriting).  All other keys overwrite on update.
+    query: str
+    max_sources: int
+    retrieved_count: int
+    clarification: str | None
+    needs_clarification: bool
+    clarification_question: str | None
+    ambiguities: list[str]
+    plan: ResearchPlan | None
+    search_results: list[SearchResult]
+    evidence_validation: EvidenceValidation | None
+    summary: ResearchSummary | None
+    citations: CitationOutput | None
+    self_review: SelfReview | None
+    current_step: str
+    step_log: list[dict[str, Any]]
+    messages: Annotated[list[BaseMessage], add_messages]
+    error: str | None
 
-    # NOTE: LangGraph requires TypedDict for typed states but we keep a plain
-    # dict subclass here for flexibility; the annotations below are docstrings
-    # rather than runtime-enforced — Pydantic validation happens inside agents.
 
-    def __class_getitem__(cls, _):  # noqa: D105
-        return cls
-
-
-def make_initial_state(query: str, max_sources: int = 5) -> dict[str, Any]:
+def make_initial_state(
+    query: str,
+    max_sources: int = 5,
+    clarification: str | None = None,
+) -> ResearchState:
     return {
         "query": query,
         "max_sources": max_sources,
+        "retrieved_count": 0,
+        "clarification": clarification,
+        "needs_clarification": False,
+        "clarification_question": None,
+        "ambiguities": [],
         "plan": None,
         "search_results": [],
+        "evidence_validation": None,
         "summary": None,
         "citations": None,
+        "self_review": None,
         "current_step": "initializing",
         "step_log": [],
         "messages": [],

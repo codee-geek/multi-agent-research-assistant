@@ -1,7 +1,7 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
-export default function ResearchReport({ title, summary, keyFindings, subQueries, totalSources, elapsed }) {
+export default function ResearchReport({ title, summary, keyFindings, subQueries, totalSources, validatedSources, elapsed }) {
   const handleCopy = () => {
     navigator.clipboard.writeText(`# ${title}\n\n${summary}`)
   }
@@ -19,7 +19,9 @@ export default function ResearchReport({ title, summary, keyFindings, subQueries
               <span className="text-xs text-gray-600">in {elapsed}s</span>
             )}
             {totalSources != null && (
-              <span className="text-xs text-gray-600">· {totalSources} sources</span>
+              <span className="text-xs text-gray-600">
+                · {validatedSources != null ? `${validatedSources}/${totalSources}` : totalSources} sources
+              </span>
             )}
           </div>
           <h2 className="text-xl font-bold text-white leading-snug">{title}</h2>

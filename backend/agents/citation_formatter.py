@@ -11,7 +11,6 @@ so the frontend can render a proper bibliography.
 from __future__ import annotations
 
 import logging
-from datetime import date
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -27,6 +26,8 @@ research summary, select the most relevant sources and format them as structured
 citations.
 
 Rules:
+- ONLY cite sources from the provided list — never invent URLs or titles.
+- If no sources are provided, return empty citations and apa_references lists.
 - Select 3-6 of the most informative / credible sources.
 - For each citation, provide a short excerpt (1-2 sentences) directly from or \
   closely paraphrasing the source snippet.
@@ -62,6 +63,20 @@ async def citation_formatter_node(state: dict[str, Any]) -> dict[str, Any]:
 
     logger.info("[CitationFormatter] Formatting citations from %d sources", len(results))
 
+    if not results:
+        citations = CitationOutput(citations=[], apa_references=[])
+        logger.info("[CitationFormatter] No sources available — skipping LLM citation step")
+        return {
+            "citations": citations,
+            "current_step": "self_review",
+            "step_log": state.get("step_log", []) + [{
+                "agent": "citation_formatter",
+                "output": {"citation_count": 0, "urls": []},
+            }],
+            "messages": state.get("messages", [])
+            + [AIMessage(content="No sources to cite — skipped citation formatting.")],
+        }
+
     formatted_sources = _format_sources(results)
     llm = _get_llm().with_structured_output(CitationOutput)
 
@@ -92,7 +107,7 @@ async def citation_formatter_node(state: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "citations": citations,
-        "current_step": "complete",
+        "current_step": "self_review",
         "step_log": state.get("step_log", []) + [step_entry],
         "messages": state.get("messages", [])
         + messages

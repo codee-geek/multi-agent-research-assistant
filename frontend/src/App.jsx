@@ -3,17 +3,24 @@ import SearchBar from './components/SearchBar'
 import AgentTimeline from './components/AgentTimeline'
 import ResearchReport from './components/ResearchReport'
 import CitationList from './components/CitationList'
+import SelfReviewPanel from './components/SelfReviewPanel'
+import ClarificationPanel from './components/ClarificationPanel'
+import BugBotPanel from './components/BugBotPanel'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api'
 
 const INITIAL_STATE = {
-  status: 'idle',        // idle | streaming | complete | error
+  status: 'idle',        // idle | streaming | clarification | complete | error
   query: '',
   sessionId: null,
   agents: [],            // array of agent step objects
   result: null,
   error: null,
   elapsed: null,
+  clarification: null,   // { question, ambiguities }
+  maxSources: 5,
+  bugbotFlags: [],
+  bugbotReport: null,
 }
 
 export default function App() {
@@ -33,9 +40,15 @@ export default function App() {
     })
   }, [])
 
-  const handleSearch = useCallback((query, maxSources) => {
-    // Reset state
-    setState({ ...INITIAL_STATE, status: 'streaming', query })
+  const handleSearch = useCallback((query, maxSources, clarification = null) => {
+    // Reset state (keep agents when resuming after clarification)
+    setState(prev => ({
+      ...INITIAL_STATE,
+      status: 'streaming',
+      query,
+      maxSources,
+      agents: clarification ? prev.agents : [],
+    }))
 
     // Close any existing stream
     if (esRef.current) {
@@ -49,7 +62,11 @@ export default function App() {
         response = await fetch(`${API_BASE}/research`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-          body: JSON.stringify({ query, max_sources: maxSources }),
+          body: JSON.stringify({
+            query,
+            max_sources: maxSources,
+            ...(clarification ? { clarification } : {}),
+          }),
         })
       } catch (err) {
         setState(prev => ({ ...prev, status: 'error', error: 'Cannot connect to API. Is the backend running?' }))
@@ -66,28 +83,35 @@ export default function App() {
       const decoder = new TextDecoder()
       let buffer = ''
 
-      const processEvents = (raw) => {
-        const lines = (buffer + raw).split('\n')
-        buffer = lines.pop() ?? ''
+      let pendingEventType = null
+      let pendingDataLine = ''
 
-        let eventType = null
-        let dataLine = ''
+      const dispatchPending = () => {
+        if (!pendingDataLine) return
+        try {
+          const payload = JSON.parse(pendingDataLine)
+          dispatchSSE(pendingEventType ?? 'message', payload)
+        } catch { /* malformed, skip */ }
+        pendingEventType = null
+        pendingDataLine = ''
+      }
+
+      const processEvents = (raw, flush = false) => {
+        const lines = (buffer + raw).split('\n')
+        buffer = flush ? '' : (lines.pop() ?? '')
 
         for (const line of lines) {
-          if (line.startsWith('event:')) {
-            eventType = line.slice(6).trim()
-          } else if (line.startsWith('data:')) {
-            dataLine = line.slice(5).trim()
-          } else if (line === '' && dataLine) {
-            // Dispatch event
-            try {
-              const payload = JSON.parse(dataLine)
-              dispatchSSE(eventType ?? 'message', payload)
-            } catch { /* malformed, skip */ }
-            eventType = null
-            dataLine = ''
+          const normalized = line.replace(/\r$/, '')
+          if (normalized.startsWith('event:')) {
+            pendingEventType = normalized.slice(6).trim()
+          } else if (normalized.startsWith('data:')) {
+            pendingDataLine = normalized.slice(5).trim()
+          } else if (normalized === '' && pendingDataLine) {
+            dispatchPending()
           }
         }
+
+        if (flush && pendingDataLine) dispatchPending()
       }
 
       const dispatchSSE = (type, payload) => {
@@ -110,6 +134,28 @@ export default function App() {
 
           case 'step_output':
             updateAgent(payload.agent, { status: 'done', output: payload })
+            break
+
+          case 'clarification_needed':
+            setState(prev => ({
+              ...prev,
+              status: 'clarification',
+              clarification: {
+                question: payload.clarification_question,
+                ambiguities: payload.ambiguities ?? [],
+              },
+            }))
+            break
+
+          case 'bugbot_flag':
+            setState(prev => ({
+              ...prev,
+              bugbotFlags: [...prev.bugbotFlags, payload],
+            }))
+            break
+
+          case 'bugbot_report':
+            setState(prev => ({ ...prev, bugbotReport: payload }))
             break
 
           case 'complete':
@@ -143,7 +189,10 @@ export default function App() {
       try {
         while (true) {
           const { value, done } = await reader.read()
-          if (done) break
+          if (done) {
+            processEvents(decoder.decode(), true)
+            break
+          }
           processEvents(decoder.decode(value, { stream: true }))
         }
       } catch (err) {
@@ -160,15 +209,21 @@ export default function App() {
     run()
   }, [updateAgent])
 
+  const { status, query, agents, result, error, elapsed, clarification, maxSources, bugbotFlags, bugbotReport } = state
+  const isStreaming = status === 'streaming'
+  const isClarification = status === 'clarification'
+  const isComplete = status === 'complete'
+  const isError = status === 'error'
+  const isActive = isStreaming || isClarification || isComplete
+
+  const handleClarificationSubmit = useCallback((answer) => {
+    handleSearch(query, maxSources, answer)
+  }, [handleSearch, query, maxSources])
+
   const handleReset = () => {
     if (esRef.current) esRef.current.close()
     setState(INITIAL_STATE)
   }
-
-  const { status, query, agents, result, error, elapsed } = state
-  const isStreaming = status === 'streaming'
-  const isComplete = status === 'complete'
-  const isError = status === 'error'
 
   return (
     <div className="min-h-screen bg-gray-950 flex flex-col">
@@ -188,9 +243,9 @@ export default function App() {
           <div className="flex items-center gap-3 text-xs text-gray-500">
             <span className="hidden sm:flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse-slow"></span>
-              4-agent pipeline
+              6-agent pipeline
             </span>
-            {(isStreaming || isComplete) && (
+            {(isStreaming || isComplete || isClarification) && (
               <button
                 onClick={handleReset}
                 className="px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors"
@@ -215,7 +270,7 @@ export default function App() {
               Multi-Agent Research Assistant
             </h2>
             <p className="text-gray-400 max-w-lg mb-2">
-              A 4-agent LangGraph pipeline — <span className="text-gray-300">Planner → Retriever → Summarizer → Citation Formatter</span> — orchestrated with MCP tool integration and GPT-4o structured output.
+              A 6-agent LangGraph pipeline — <span className="text-gray-300">Planner → Retriever → Evidence Validator → Summarizer → Citation Formatter → Self-Review</span> — orchestrated with MCP tool integration and GPT-4o structured output.
             </p>
             <p className="text-gray-600 text-sm mb-10">Enter any research question below to begin.</p>
             <div className="w-full max-w-2xl">
@@ -226,7 +281,7 @@ export default function App() {
         )}
 
         {/* Search bar (active state) */}
-        {status !== 'idle' && (
+        {isActive && (
           <div className="animate-slide-up">
             <SearchBar
               onSearch={handleSearch}
@@ -235,6 +290,22 @@ export default function App() {
               compact
             />
           </div>
+        )}
+
+        {/* Clarification prompt */}
+        {isClarification && clarification && (
+          <ClarificationPanel
+            query={query}
+            question={clarification.question}
+            ambiguities={clarification.ambiguities}
+            onSubmit={handleClarificationSubmit}
+            disabled={isStreaming}
+          />
+        )}
+
+        {/* BugBot monitor */}
+        {isActive && (bugbotFlags.length > 0 || bugbotReport) && (
+          <BugBotPanel flags={bugbotFlags} report={bugbotReport} />
         )}
 
         {/* Error banner */}
@@ -249,7 +320,7 @@ export default function App() {
         )}
 
         {/* Agent timeline */}
-        {(isStreaming || isComplete) && agents.length > 0 && (
+        {isActive && agents.length > 0 && (
           <div className="animate-fade-in">
             <AgentTimeline agents={agents} isStreaming={isStreaming} />
           </div>
@@ -264,12 +335,14 @@ export default function App() {
               keyFindings={result.summary?.key_findings}
               subQueries={result.plan?.sub_queries}
               totalSources={result.total_sources}
+              validatedSources={result.validated_sources}
               elapsed={elapsed}
             />
             <CitationList
               citations={result.citations?.citations}
               apaRefs={result.citations?.apa_references}
             />
+            <SelfReviewPanel review={result.self_review} />
           </div>
         )}
       </main>

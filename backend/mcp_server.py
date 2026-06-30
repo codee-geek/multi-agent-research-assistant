@@ -14,7 +14,7 @@ import os
 import logging
 from typing import Optional
 
-from duckduckgo_search import DDGS
+from tools.search import search_web
 from fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
@@ -44,21 +44,7 @@ def web_search(
         List of dicts with keys: title, url, snippet.
     """
     max_results = max(2, min(max_results, 10))
-    results: list[dict] = []
-
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, region=region, max_results=max_results):
-                results.append(
-                    {
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "snippet": r.get("body", ""),
-                    }
-                )
-    except Exception as exc:
-        logger.warning("DuckDuckGo search failed for %r: %s", query, exc)
-
+    results = search_web(query, max_results=max_results, region=region)
     logger.info("web_search(%r) → %d results", query, len(results))
     return results
 
@@ -81,6 +67,8 @@ def news_search(
     results: list[dict] = []
 
     try:
+        from duckduckgo_search import DDGS
+
         with DDGS() as ddgs:
             for r in ddgs.news(query, max_results=max_results):
                 results.append(
@@ -104,13 +92,13 @@ def batch_search(queries: list[str], max_results_per_query: int = 4) -> dict[str
     """Run multiple web searches in sequence and return results keyed by query.
 
     Args:
-        queries: List of search queries (max 6).
+        queries: List of search queries (max 10).
         max_results_per_query: Results per query.
 
     Returns:
         Dict mapping each query to its list of search results.
     """
-    queries = queries[:6]
+    queries = queries[:10]
     output: dict[str, list[dict]] = {}
 
     for q in queries:

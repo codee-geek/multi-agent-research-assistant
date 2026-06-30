@@ -1,0 +1,855 @@
+================================================================================
+  MULTI-AGENT RESEARCH ASSISTANT — LIVING SPEC & INTERVIEW MIND MAP
+================================================================================
+  Last updated : 2026-07-01
+  Maintainer   : YOU (update this file every time you add a feature or fix a bug)
+  Project root : multi-agent-research-assistant/
+
+  HOW TO USE THIS FILE IN CURSOR / VS CODE
+  ----------------------------------------
+  Paths like  backend/main.py:137  are CLICKABLE — Cmd+Click (Mac) or Ctrl+Click
+  (Windows) jumps to that exact line in the file.
+
+  READ ORDER (recommended for first-time understanding)
+  -----------------------------------------------------
+  Pass 1 → Section 2  (10-line architecture)
+  Pass 2 → Section 3  (one user journey)
+  Pass 3 → Section 7  (schemas + state)
+  Pass 4 → Section 5  (LangGraph orchestration)
+  Pass 5 → Section 8  (frontend + SSE)
+  Pass 6 → Section 12 (changelog — what changed and why)
+  Pass 7 → Section 13 (interview talking points)
+
+================================================================================
+  SECTION 1 — WHAT IS THIS PROJECT? (elevator pitch)
+================================================================================
+
+A portfolio-grade autonomous research system:
+
+  User types a research question in React UI
+       ↓
+  FastAPI receives it, streams progress via SSE (Server-Sent Events)
+       ↓
+  LangGraph runs 6 AI agents in sequence (with optional clarification loop)
+       ↓
+  Retriever calls MCP tools → web search (DuckDuckGo via ddgs)
+       ↓
+  GPT-4o synthesizes a markdown report + citations + self-review
+       ↓
+  BugBot monitors every step, logs issues to backend/logs/
+
+Stack: React + Vite | FastAPI | LangGraph | LangChain | OpenAI GPT-4o |
+       MCP (FastMCP) | DuckDuckGo search | Docker Compose
+
+Ports (local dev):
+  Frontend  → http://localhost:5173
+  Backend   → http://localhost:8000  (API docs: /api/docs)
+  MCP server→ http://localhost:8001
+
+
+================================================================================
+  SECTION 2 — ARCHITECTURE IN 10 LINES
+================================================================================
+
+  1. React UI (frontend/src/App.jsx) POSTs query → FastAPI /api/research
+  2. main.py creates SessionTrace + opens SSE stream from stream_research()
+  3. LangGraph StateGraph runs 6 nodes; state dict flows node → node
+  4. Planner (GPT-4o) either asks clarification OR outputs sub-queries
+  5. Retriever calls MCP batch_search OR direct search_web() fallback
+  6. Evidence Validator filters sources; Summarizer writes markdown report
+  7. Citation Formatter picks best sources; Self-Review scores quality
+  8. main.py maps each node update → SSE events (step_start, step_output, …)
+  9. BugBot.check_step() after every node; flags sent as bugbot_flag SSE
+ 10. On end: complete SSE + bugbot_report; trace saved to backend/logs/
+
+
+================================================================================
+  SECTION 3 — USER JOURNEY (trace one query end-to-end)
+================================================================================
+
+JOURNEY A — NORMAL QUERY (e.g. "Bhosle family history")
+--------------------------------------------------------
+
+  [1] USER — frontend/src/components/SearchBar.jsx:11
+      Types query (min 5 chars), clicks Research.
+      Calls onSearch(query, maxSources) → App.handleSearch
+
+  [2] APP — frontend/src/App.jsx:43
+      POST http://localhost:8000/api/research
+      Body: { "query": "...", "max_sources": 5 }
+      Accept: text/event-stream
+      Parses SSE lines manually (fetch + ReadableStream, NOT EventSource)
+
+  [3] BACKEND ENTRY — backend/main.py:137
+      research() endpoint:
+        - Creates session_id (UUID)
+        - Creates SessionTrace (monitoring/session_trace.py:34)
+        - Calls stream_research() from graph/research_graph.py:68
+
+  [4] GRAPH START — backend/graph/research_graph.py:68
+      make_initial_state() builds empty ResearchState
+      Graph streams updates: { "node": "<name>", "state_patch": {...} }
+
+  [5] PLANNER NODE — backend/agents/planner.py:85
+      GPT-4o + PlannerDecision schema → action="plan"
+      Returns: plan (ResearchPlan with sub_queries), current_step="retriever"
+      SSE: step_start(planner) → step_output(sub_queries)
+
+      IF ambiguous/greeting → action="clarify" → see JOURNEY B
+
+  [6] RETRIEVER NODE — backend/agents/retriever.py:86
+      Tries MCP batch_search (up to 10 queries)
+      If MCP fails OR returns 0 → direct search_web() fallback
+      Dedupes by URL → search_results[], retrieved_count
+      SSE: step_output(total_results, sources preview)
+
+  [7] EVIDENCE VALIDATOR — backend/agents/evidence_validator.py:105
+      GPT-4o scores each source vs RESEARCH PLAN (not just raw query)
+      Keeps is_relevant sources; fallback keeps top 3 if all rejected
+      SSE: step_output(kept, rejected, evidence_gaps)
+
+  [8] SUMMARIZER — backend/agents/summarizer.py:67
+      GPT-4o → ResearchSummary (title, markdown, key_findings)
+      If no sources: honest empty-state message (not fake research)
+      SSE: step_output(title, key_findings, summary)
+
+  [9] CITATION FORMATTER — backend/agents/citation_formatter.py:58
+      If search_results empty → skip LLM, return 0 citations (no hallucination)
+      Else GPT-4o → CitationOutput (3-6 citations + APA strings)
+      SSE: step_output(citations, apa_references)
+
+  [10] SELF-REVIEW — backend/agents/self_review.py:41
+       GPT-4o → SelfReview (quality_score 0-10, approved, risks)
+       SSE: step_output(quality_score, strengths, weaknesses, …)
+
+  [11] FINALIZE — backend/main.py:305
+       Assembles final_payload → SSE event "complete"
+       BugBot.finalize_session() → SSE "bugbot_report"
+       SessionTrace.save() → backend/logs/sessions/<date>_<id>.json
+       Result cached in _result_cache (1 hour TTL)
+
+  [12] UI RENDER — frontend/src/App.jsx:161
+       status='complete' → ResearchReport, CitationList, SelfReviewPanel
+
+
+JOURNEY B — CLARIFICATION LOOP (e.g. "vectorless rag" or "hi, how are you")
+---------------------------------------------------------------------------
+
+  [1-4] Same as Journey A until Planner
+
+  [5] PLANNER returns needs_clarification=True
+      backend/agents/planner.py:106
+      Graph routes to END (not retriever) — research_graph.py:28
+      SSE: clarification_needed + step_output(action=clarify)
+      Pipeline PAUSES — no complete event
+
+  [6] UI shows ClarificationPanel — frontend/src/components/ClarificationPanel.jsx:3
+      User picks ambiguity or types answer
+
+  [7] App.handleClarificationSubmit — frontend/src/App.jsx:219
+      POST /api/research again with SAME query + clarification field:
+      { "query": "vectorless rag", "clarification": "PageIndex approach", ... }
+      NEW session_id (fresh graph run; planner sees clarification in prompt)
+
+  [8] Planner proceeds with action="plan" → continues Journey A from step 6
+
+
+JOURNEY C — BUGBOT FLAGS IN REAL TIME
+------------------------------------
+
+  After EVERY agent node in main.py:192
+    BugBot.check_step(node, patch, trace, query)
+    If issue found → SSE bugbot_flag immediately
+    User sees BugBotPanel — frontend/src/components/BugBotPanel.jsx:14
+
+  At session end → bugbot_report SSE + append to:
+    backend/logs/bugbot_observations.txt  (human readable)
+    backend/logs/bugbot_flags.jsonl       (machine readable)
+
+
+================================================================================
+  SECTION 4 — QUERY FLOW DIAGRAMS (ASCII)
+================================================================================
+
+NORMAL FLOW
+-----------
+
+  USER → SearchBar → POST /api/research
+                          │
+                          ▼
+                    ┌───────────┐
+                    │  PLANNER  │──clarify──► END (wait for user)
+                    └─────┬─────┘
+                          │ plan
+                          ▼
+                    ┌───────────┐     MCP SSE      ┌─────────────┐
+                    │ RETRIEVER │◄───────────────►│ mcp_server  │
+                    └─────┬─────┘   batch_search  │  :8001      │
+                          │                       └─────────────┘
+                          │ (fallback: tools/search.py)
+                          ▼
+              ┌───────────────────────┐
+              │  EVIDENCE VALIDATOR   │
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │     SUMMARIZER        │
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │  CITATION FORMATTER   │
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │     SELF-REVIEW       │
+              └───────────┬───────────┘
+                          ▼
+                         END → SSE complete + bugbot_report
+
+
+STATE FLOW (what travels between nodes)
+---------------------------------------
+
+  ResearchState (graph/state.py:20) is a TypedDict — each node returns a
+  PARTIAL dict; LangGraph MERGES it into the full state.
+
+  Key fields through pipeline:
+    query ────────────────────► (unchanged, original user question)
+    clarification ────────────► (optional, from API request)
+    plan ─────────────────────► set by planner
+    search_results ───────────► set by retriever, FILTERED by validator
+    retrieved_count ──────────► set by retriever (original count before filter)
+    evidence_validation ──────► set by validator
+    summary ──────────────────► set by summarizer
+    citations ────────────────► set by citation_formatter
+    self_review ──────────────► set by self_review
+    step_log ─────────────────► append-only audit trail per agent
+    messages ─────────────────► LangChain message history (add_messages reducer)
+
+
+================================================================================
+  SECTION 5 — LANGGRAPH PIPELINE (orchestration deep dive)
+================================================================================
+
+FILE: backend/graph/research_graph.py
+
+  build_graph() — backend/graph/research_graph.py:34
+  WHY: Wires nodes and edges into a compiled StateGraph.
+  HOW:
+    - StateGraph(ResearchState) — typed state schema
+    - add_node for each of 6 agents
+    - START → planner
+    - CONDITIONAL EDGE after planner (the only branch in the pipeline):
+
+  _route_after_planner() — backend/graph/research_graph.py:28
+  WHY: Human-in-the-loop — stop pipeline if planner needs clarification.
+  HOW:
+    if state["needs_clarification"] → return END
+    else → return "retriever"
+
+  research_graph — backend/graph/research_graph.py:65
+  Singleton compiled graph, imported by main.py
+
+  stream_research() — backend/graph/research_graph.py:68
+  WHY: Async wrapper so FastAPI can stream node-by-node updates.
+  HOW:
+    initial_state = make_initial_state(query, max_sources, clarification)
+    async for chunk in research_graph.astream(initial_state, stream_mode="updates"):
+      yield {"node": node_name, "state_patch": patch}
+
+  FULL EDGE LIST:
+    START → planner
+    planner → retriever  (if plan)
+    planner → END        (if clarify)
+    retriever → evidence_validator
+    evidence_validator → summarizer
+    summarizer → citation_formatter
+    citation_formatter → self_review
+    self_review → END
+
+
+================================================================================
+  SECTION 6 — MCP (Model Context Protocol) EXPLAINED
+================================================================================
+
+WHAT IS MCP HERE?
+  MCP is a standard way for AI agents to call external TOOLS (like web search)
+  over HTTP/SSE. Our retriever does NOT search the web itself — it calls an
+  MCP server that exposes search tools.
+
+WHY SEPARATE MCP SERVER?
+  - Docker: mcp-server container runs independently (docker-compose.yml:6)
+  - Reusable: any agent/framework can call the same tools
+  - Clean boundary: search logic isolated from LangGraph pipeline
+
+FILE: backend/mcp_server.py
+  FastMCP server named "research-tools" on port 8001
+
+  web_search() — mcp_server.py:31
+    Single query → list of {title, url, snippet}
+    Delegates to tools/search.py:search_web()
+
+  news_search() — mcp_server.py:53
+    News-specific search (not used by current pipeline, available as tool)
+
+  batch_search() — mcp_server.py:91
+    Runs web_search for up to 10 queries sequentially
+    Returns dict: { "query text": [results...], ... }
+    Used by retriever via langchain-mcp-adapters
+
+HOW RETRIEVER CALLS MCP — backend/agents/retriever.py:28
+  1. MultiServerMCPClient connects to MCP_SERVER_URL (env var)
+     Default Docker: http://mcp-server:8001/sse
+     Default local:  http://localhost:8001/sse
+  2. client.get_tools() → find "batch_search"
+  3. batch_tool.ainvoke({queries, max_results_per_query})
+  4. Parse response into SearchResult Pydantic objects
+
+FALLBACK CHAIN — backend/agents/retriever.py:86
+  1. Try MCP batch_search
+  2. On exception → direct search_web() for each sub-query
+  3. If MCP returns 0 total results → also try direct search_web()
+  WHY: Old duckduckgo_search package returned 0 results silently; ddgs works.
+
+SEARCH IMPLEMENTATION — backend/tools/search.py:10
+  search_web(query, max_results, region)
+  1. Try ddgs package (primary, works in 2025+)
+  2. Fallback duckduckgo_search (deprecated but kept)
+  Returns: [{title, url, snippet}, ...]
+
+
+================================================================================
+  SECTION 7 — SCHEMAS & STATE (Pydantic + TypedDict)
+================================================================================
+
+FILE: backend/models/schemas.py — ALL data contracts
+
+LLM STRUCTURED OUTPUTS (enforced via .with_structured_output())
+---------------------------------------------------------------
+
+  PlannerDecision — schemas.py:12
+    action: "plan" | "clarify"
+    sub_queries: list (when plan, 2-10 items)
+    clarification_question + ambiguities (when clarify)
+    WHY: Planner must explicitly choose — no silent guessing on ambiguous queries
+
+  ResearchPlan — schemas.py:47
+    sub_queries + reasoning
+    Stored in graph state after planner commits to a plan
+
+  SearchResult — schemas.py:57
+    title, url, snippet, query (which sub-query found this)
+
+  ResearchSummary — schemas.py:70
+    title, summary (markdown), key_findings[]
+
+  Citation / CitationOutput — schemas.py:77, :85
+    Per-source citation + APA reference strings
+
+  EvidenceValidation — schemas.py:99
+    assessments[] (per-source scores), rejected_count, evidence_gaps[]
+
+  SelfReview — schemas.py:107
+    quality_score (0-10), approved, strengths, weaknesses,
+    hallucination_risks, improvement_suggestions, overall_assessment
+
+API CONTRACTS
+-------------
+
+  ResearchRequest — schemas.py:120
+    query (5-500 chars), max_sources (2-10), clarification (optional)
+
+  ResearchResponse — schemas.py:138
+    Final shape sent in SSE "complete" event
+
+GRAPH STATE
+-----------
+
+  ResearchState — graph/state.py:20
+    TypedDict with total=False (all keys optional for partial updates)
+
+  make_initial_state() — graph/state.py:47
+    Factory for fresh session:
+      query, max_sources, clarification, needs_clarification=False,
+      plan=None, search_results=[], retrieved_count=0, etc.
+
+  messages field uses Annotated[list, add_messages]
+    LangGraph reducer — new messages APPEND, not replace
+
+
+================================================================================
+  SECTION 8 — FRONTEND (React + SSE)
+================================================================================
+
+ENTRY: frontend/src/main.jsx:6
+  ReactDOM.createRoot → <App /> in StrictMode
+
+ROOT ORCHESTRATOR: frontend/src/App.jsx
+  ONLY file that talks to backend.
+
+  State machine statuses:
+    idle → streaming → complete | error | clarification
+
+  SSE events handled (dispatchSSE — App.jsx:117):
+    session            → store sessionId
+    step_start         → AgentTimeline card "running"
+    step_output        → AgentTimeline card "done" + preview
+    clarification_needed → show ClarificationPanel
+    bugbot_flag        → append to bugbotFlags[]
+    bugbot_report      → set bugbotReport
+    complete           → show full report
+    error              → error banner
+
+  WHY fetch instead of EventSource?
+    POST /api/research needs a JSON body; native EventSource only supports GET.
+
+PROXY: frontend/vite.config.js:8
+  /api → http://localhost:8000 (dev only)
+
+COMPONENTS (presentational — no direct API calls)
+-------------------------------------------------
+
+  SearchBar.jsx:3          — query input + sources slider
+  ClarificationPanel.jsx:3 — ambiguity picker + textarea
+  AgentTimeline.jsx:58     — 6-agent pipeline visualizer
+  BugBotPanel.jsx:14       — live flags + session verdict
+  ResearchReport.jsx:4     — markdown report (react-markdown)
+  CitationList.jsx:3       — references + APA toggle
+  SelfReviewPanel.jsx:1    — quality review details
+  ExampleQueries.jsx:359   — idle-state demo buttons (inside App.jsx)
+
+
+================================================================================
+  SECTION 9 — SYSTEM PROMPTS CATALOG (why each agent behaves as it does)
+================================================================================
+
+  PLANNER — backend/agents/planner.py:23 (_SYSTEM_PROMPT)
+  --------------------------------
+  Role: Research planning specialist
+  Key rules:
+    - action=clarify for: jargon with multiple meanings, missing scope,
+      greetings/non-research ("hi", "how are you"), uncertainty
+    - action=plan only when scope is clear or user already clarified
+    - 5-10 sub-queries, no overlap, background→current→implications
+  Examples embedded: "vectorless rag", "hi, how are you"
+
+  EVIDENCE VALIDATOR — backend/agents/evidence_validator.py:22
+  --------------------------------
+  Role: Evidence validation specialist
+  Key rules:
+    - Judge against RESEARCH PLAN + sub-queries, not just raw user query
+    - relevance_score 0-1; is_relevant if >= 0.4
+    - Strict on spam; don't reject sources that match planned sub-queries
+
+  SUMMARIZER — backend/agents/summarizer.py:23
+  --------------------------------
+  Role: Expert research analyst
+  Key rules:
+    - Synthesize (don't concatenate snippets)
+    - Markdown with ## headings
+    - Compare sources, note agreements/contradictions
+
+  CITATION FORMATTER — backend/agents/citation_formatter.py:23
+  --------------------------------
+  Role: Academic citation specialist
+  Key rules:
+    - ONLY cite provided sources — never invent URLs
+    - If no sources → empty lists (also enforced in code, not just prompt)
+    - APA 7th edition format
+
+  SELF-REVIEW — backend/agents/self_review.py:22
+  --------------------------------
+  Role: Rigorous research quality reviewer
+  Key rules:
+    - quality_score 0-10; approved only if >= 6.0 AND no critical hallucination risks
+    - Flag unsupported claims explicitly
+
+  STRUCTURED OUTPUT PATTERN (all LLM agents)
+  -------------------------------------------
+  llm = ChatOpenAI(model="gpt-4o", temperature=X)
+  llm = llm.with_structured_output(SomePydanticModel)
+  result = await llm.ainvoke([SystemMessage, HumanMessage])
+  WHY: OpenAI returns JSON matching schema; Pydantic validates — no free-text parsing
+
+
+================================================================================
+  SECTION 10 — BUGBOT MONITOR (quality watchdog)
+================================================================================
+
+FILES:
+  backend/monitoring/bugbot.py      — heuristics + verdict
+  backend/monitoring/session_trace.py — per-session I/O log
+
+WHEN IT RUNS:
+  - After EVERY agent node: BugBot.check_step() — main.py:192
+  - At session end: BugBot.finalize_session() — main.py (complete/error/clarify)
+
+WHAT IT CHECKS (BugBot class — bugbot.py:102)
+  _check_planner        — non-research query planned anyway; 9+ sub-queries
+  _check_retriever      — 0 sources; very sparse retrieval
+  _check_validator      — retrieved N but kept 0 (CRITICAL); heavy filtering
+  _check_summarizer     — title "No sources found" / "Sources filtered out"
+  _check_citation_formatter — citations when 0 sources (fabricated)
+  _check_self_review    — low score; hallucination risks flagged
+
+VERDICTS (Verdict enum — bugbot.py:50)
+  ok   — no flags
+  warn — medium/low flags only
+  fail — high/critical flags or pipeline error
+
+LOG FILES (gitignored, live on disk)
+  backend/logs/bugbot_observations.txt  — human-readable session notes
+  backend/logs/bugbot_flags.jsonl       — JSON lines for programmatic analysis
+  backend/logs/sessions/<date>_<uuid>.json — full I/O trace per session
+
+API (not wired to UI yet, but available)
+  GET /api/bugbot/observations?tail=200  — main.py:455
+  GET /api/bugbot/sessions/{id}          — main.py:462
+
+
+================================================================================
+  SECTION 11 — COMPLETE FILE & FUNCTION INDEX (nothing left untouched)
+================================================================================
+
+  Legend:  → purpose   |  Click path:line in Cursor to jump
+
+────────────────────────────────────────────────────────────────────────────────
+BACKEND ROOT
+────────────────────────────────────────────────────────────────────────────────
+
+  backend/main.py
+  ├── app:41                    → FastAPI application instance
+  ├── _result_cache:64          → In-memory completed session cache (1hr TTL)
+  ├── _AGENT_META:70            → UI labels/icons for SSE step_start events
+  ├── _NODE_ORDER:103           → Agent order for step numbering (1-6)
+  ├── _sse():115                → Wrap payload as SSE {event, data} dict
+  ├── _step_start_event():119   → Build step_start SSE for an agent node
+  ├── research():137            → ★ MAIN ENDPOINT POST /api/research (SSE stream)
+  │   └── event_generator():159 → Inner async generator; drives entire session
+  ├── get_research_result():440 → GET cached result by session_id
+  ├── bugbot_observations():455 → GET tail of observations log
+  ├── bugbot_session_trace():462→ GET JSON trace for a session
+  └── health():474              → GET liveness probe
+
+  backend/mcp_server.py
+  ├── mcp:25                    → FastMCP server instance ("research-tools")
+  ├── web_search():31           → MCP tool: single web query
+  ├── news_search():53          → MCP tool: news search (unused in pipeline)
+  └── batch_search():91         → MCP tool: multiple queries (used by retriever)
+
+────────────────────────────────────────────────────────────────────────────────
+AGENTS (LangGraph nodes — each returns partial ResearchState)
+────────────────────────────────────────────────────────────────────────────────
+
+  backend/agents/planner.py
+  ├── _SYSTEM_PROMPT:23         → Clarify vs plan decision rules
+  ├── _get_llm():70             → GPT-4o temp=0.2
+  ├── _build_user_message():74  → Formats query + optional clarification
+  └── planner_node():85         → ★ NODE 1: plan OR needs_clarification
+
+  backend/agents/retriever.py
+  ├── MCP_SERVER_URL:25         → Env: MCP SSE endpoint
+  ├── _search_via_mcp():28      → Call MCP batch_search tool
+  ├── _search_direct_fallback():64 → Direct ddgs search per sub-query
+  └── retriever_node():86       → ★ NODE 2: fetch + dedupe sources
+
+  backend/agents/evidence_validator.py
+  ├── _SYSTEM_PROMPT:22         → Validate against plan context
+  ├── _MAX_SOURCES:40           → Cap sources sent to LLM (20)
+  ├── _FALLBACK_KEEP:42         → Keep top 3 if strict filter removes all
+  ├── _format_sources():46      → Numbered list for LLM prompt
+  ├── _format_plan_context():58 → Include plan reasoning + sub-queries
+  ├── _filter_validated():74    → Keep is_relevant=True sources
+  ├── _fallback_keep_top_scored():86 → Safety net when filter returns empty
+  └── evidence_validator_node():105 → ★ NODE 3: filter sources
+
+  backend/agents/summarizer.py
+  ├── _SYSTEM_PROMPT:23         → Synthesis rules (markdown, compare sources)
+  ├── _format_results():43      → Truncate sources to fit context window
+  └── summarizer_node():67      → ★ NODE 4: markdown report
+
+  backend/agents/citation_formatter.py
+  ├── _SYSTEM_PROMPT:23         → Cite ONLY provided sources
+  ├── _format_sources():43      → Up to 15 sources for LLM
+  └── citation_formatter_node():58 → ★ NODE 5: citations + APA
+      Early return at :62 if no sources (prevents hallucination)
+
+  backend/agents/self_review.py
+  ├── _SYSTEM_PROMPT:22         → Quality bar: score>=6, flag hallucinations
+  └── self_review_node():41     → ★ NODE 6: final quality gate
+
+  backend/agents/__init__.py:1  → Re-exports all *_node functions
+
+────────────────────────────────────────────────────────────────────────────────
+GRAPH
+────────────────────────────────────────────────────────────────────────────────
+
+  backend/graph/state.py
+  ├── ResearchState:20          → TypedDict — full pipeline state shape
+  └── make_initial_state():47   → Fresh state factory for new session
+
+  backend/graph/research_graph.py
+  ├── _route_after_planner():28 → Conditional: END vs retriever
+  ├── build_graph():34          → Wire 6 nodes + edges, compile
+  ├── research_graph:65         → Compiled singleton
+  └── stream_research():68      → Async generator for FastAPI SSE
+
+  backend/graph/__init__.py:1   → Exports research_graph, stream_research
+
+────────────────────────────────────────────────────────────────────────────────
+MODELS
+────────────────────────────────────────────────────────────────────────────────
+
+  backend/models/schemas.py     → See Section 7 for all 14 Pydantic models
+  backend/models/__init__.py:1  → Partial re-exports (not all models)
+
+────────────────────────────────────────────────────────────────────────────────
+MONITORING
+────────────────────────────────────────────────────────────────────────────────
+
+  backend/monitoring/session_trace.py
+  ├── LOGS_DIR:10               → backend/logs/
+  ├── SESSIONS_DIR:11           → backend/logs/sessions/
+  ├── _serialize():18           → Pydantic → JSON-safe dict
+  └── SessionTrace:31
+      ├── __init__():34         → New trace for session
+      ├── record_node():54      → Log agent patch
+      ├── record_flag():62      → Log BugBot flag
+      ├── finalize():65         → Set status + elapsed
+      ├── to_dict():79         → Full trace as dict
+      └── save():95             → Write JSON file
+
+  backend/monitoring/bugbot.py
+  ├── Severity:43               → low | medium | high | critical
+  ├── Verdict:50                → ok | warn | fail
+  ├── BugFlag:57                → Single issue dataclass
+  ├── SessionVerdict:75         → End-of-session report
+  └── BugBot:102
+      ├── is_likely_non_research():109 → Regex greeting/chitchat detector
+      ├── check_step():122      → Per-node heuristic checks
+      ├── finalize_session():358 → Verdict + write logs
+      ├── _compute_verdict():418 → Map flags → ok/warn/fail
+      ├── _build_summaries():431 → performed_well / failed lists
+      ├── _append_observations():504 → Human-readable log block
+      └── read_observations():565 → Read tail for API
+
+  backend/monitoring/__init__.py:1 → Exports BugBot, SessionTrace, etc.
+
+────────────────────────────────────────────────────────────────────────────────
+TOOLS
+────────────────────────────────────────────────────────────────────────────────
+
+  backend/tools/search.py
+  └── search_web():10           → ddgs primary, duckduckgo_search fallback
+
+  backend/tools/__init__.py     → Empty package marker
+
+────────────────────────────────────────────────────────────────────────────────
+FRONTEND
+────────────────────────────────────────────────────────────────────────────────
+
+  frontend/src/main.jsx:6       → React bootstrap
+  frontend/vite.config.js:4     → Dev server + /api proxy
+
+  frontend/src/App.jsx
+  ├── INITIAL_STATE:12          → Default React state shape
+  ├── App():26                  → Root component + SSE client
+  ├── updateAgent():30          → Upsert agent in timeline
+  ├── handleSearch():43         → ★ POST /api/research + SSE parse loop
+  ├── handleClarificationSubmit():219 → Resume with clarification text
+  ├── handleReset():223         → Reset to idle
+  └── ExampleQueries():359      → Demo query buttons
+
+  frontend/src/components/SearchBar.jsx:3
+  frontend/src/components/ClarificationPanel.jsx:3
+  frontend/src/components/AgentTimeline.jsx:58
+  frontend/src/components/BugBotPanel.jsx:14
+  frontend/src/components/ResearchReport.jsx:4
+  frontend/src/components/CitationList.jsx:3
+  frontend/src/components/SelfReviewPanel.jsx:1
+
+────────────────────────────────────────────────────────────────────────────────
+INFRASTRUCTURE
+────────────────────────────────────────────────────────────────────────────────
+
+  docker-compose.yml            → 3 services: mcp-server, backend, frontend
+  .env.example                  → OPENAI_API_KEY, MCP_SERVER_URL, PORT, ENV
+  backend/requirements.txt      → Python dependencies
+  frontend/package.json         → React/Vite dependencies
+
+
+================================================================================
+  SECTION 12 — CHANGELOG (living updates — ADD HERE ON EVERY CHANGE)
+================================================================================
+
+  RULE: When you change code, add an entry at the TOP of this list.
+        Format: [DATE] WHAT changed | WHY | Files touched
+
+────────────────────────────────────────────────────────────────────────────────
+2026-07-01 — LIVING_SPEC.txt created
+  Full project mind map for interview prep. Documents entire architecture,
+  every file/function, user journeys, MCP, LangGraph, BugBot, and all prior fixes.
+
+2026-07-01 — Web search fixed (0 results bug)
+  WHAT: Replaced broken duckduckgo_search with ddgs package; shared tools/search.py
+  WHY:  duckduckgo_search returned 0 results silently (Bing 200, empty parse).
+        Caused "Bhosle family history" to retrieve nothing.
+  FILES: backend/tools/search.py (NEW)
+         backend/mcp_server.py
+         backend/agents/retriever.py (fallback when MCP returns 0)
+         backend/requirements.txt (added ddgs>=9.0.0)
+
+2026-07-01 — Citation hallucination fix
+  WHAT: citation_formatter skips LLM when search_results is empty
+  WHY:  LLM invented 3 fake citations (geni.com, britannica) when retriever had 0
+  FILES: backend/agents/citation_formatter.py
+         backend/monitoring/bugbot.py (_check_citation_formatter)
+
+2026-07-01 — BugBot monitor added
+  WHAT: Real-time pipeline monitor + observation logs
+  WHY:  Catch query/plan mismatches, source dropout, fabricated citations ASAP
+  FILES: backend/monitoring/bugbot.py (NEW)
+         backend/monitoring/session_trace.py (NEW)
+         backend/monitoring/__init__.py (NEW)
+         backend/main.py (integration + SSE bugbot_flag/bugbot_report)
+         frontend/src/components/BugBotPanel.jsx (NEW)
+         frontend/src/App.jsx
+         backend/logs/.gitkeep
+         .gitignore (ignore backend/logs/)
+
+2026-07-01 — Evidence validator scope fix
+  WHAT: Validator judges sources against research PLAN, not raw user query
+  WHY:  "hi, how are you" got etymology sources but validator rejected all (0 kept)
+  FILES: backend/agents/evidence_validator.py
+
+2026-07-01 — Evidence validator fallback
+  WHAT: If strict filter removes all sources, keep top 3 by relevance score
+  WHY:  Prevent empty pipeline when sources are borderline relevant
+  FILES: backend/agents/evidence_validator.py (_fallback_keep_top_scored)
+
+2026-07-01 — Planner clarification flow
+  WHAT: Planner can return action=clarify; graph routes to END; UI asks user
+  WHY:  Ambiguous queries ("vectorless rag") should not guess — ask user first
+  FILES: backend/agents/planner.py (PlannerDecision, _SYSTEM_PROMPT)
+         backend/models/schemas.py (PlannerDecision, ResearchRequest.clarification)
+         backend/graph/state.py (clarification fields)
+         backend/graph/research_graph.py (_route_after_planner conditional edge)
+         backend/main.py (clarification_needed SSE)
+         frontend/src/components/ClarificationPanel.jsx (NEW)
+         frontend/src/App.jsx
+
+2026-07-01 — Planner greeting detection
+  WHAT: Prompt + BugBot flag non-research inputs (hi, how are you)
+  WHY:  Greetings were decomposed into 10 etymology sub-queries
+  FILES: backend/agents/planner.py
+         backend/monitoring/bugbot.py (is_likely_non_research)
+
+2026-07-01 — ResearchPlan max sub-queries 6 → 10
+  WHAT: Pydantic max_length aligned with planner prompt (5-10)
+  WHY:  Validation error when LLM returned 10 sub-queries
+  FILES: backend/models/schemas.py
+
+2026-07-01 — Frontend blank page fix
+  WHAT: Moved state destructuring before handleClarificationSubmit
+  WHY:  ReferenceError crashed React — nothing rendered
+  FILES: frontend/src/App.jsx
+
+2026-07-01 — Summarizer empty vs filtered message
+  WHAT: Different messages when retriever found sources but validator removed all
+  WHY:  Misleading "no sources retrieved" when 45 were found then filtered
+  FILES: backend/agents/summarizer.py
+
+2026-07-01 — MCP batch_search limit 6 → 10
+  WHAT: batch_search now handles up to 10 queries (matches planner max)
+  WHY:  Planner sends 10 sub-queries; only first 6 were searched
+  FILES: backend/mcp_server.py
+
+2026-07-01 — BugBot stale state fix
+  WHAT: Reset bugbotFlags/bugbotReport on every new search (including clarification resume)
+  WHY:  Old "ok" verdict and "paused for clarification" showed on completed runs
+  FILES: frontend/src/App.jsx
+
+
+================================================================================
+  SECTION 13 — INTERVIEW TALKING POINTS
+================================================================================
+
+  "Walk me through the architecture"
+  → Section 2 (10 lines) + Section 4 diagram. Emphasize: SSE streaming,
+    LangGraph state machine, MCP tool layer, structured outputs.
+
+  "Why LangGraph instead of a single LLM call?"
+  → Each agent has a focused job + schema. Planner doesn't synthesize.
+    Retriever doesn't need GPT. Failures are isolated per step.
+    Conditional edge enables human-in-the-loop clarification.
+
+  "How do you prevent hallucinations?"
+  → Structured output (Pydantic). Citation formatter only sees real sources.
+    Code guard: skip LLM if 0 sources. Self-review flags unsupported claims.
+    BugBot detects fabricated citations in real time.
+
+  "What is MCP and why use it?"
+  → Section 6. Standard tool protocol. Search isolated in own service.
+    Retriever uses langchain-mcp-adapters. Swappable search backend.
+
+  "How does streaming work?"
+  → POST returns SSE. main.py event_generator yields after each graph node.
+    Frontend parses event:/data: lines manually (fetch stream, not EventSource).
+
+  "How do you handle ambiguous queries?"
+  → Planner action=clarify → graph END → ClarificationPanel → user answers →
+    new POST with clarification field → planner proceeds with context.
+
+  "How do you monitor quality in production?"
+  → BugBot: heuristic checks per step + session verdict logs.
+    Self-review agent as LLM quality gate. Session JSON traces for debugging.
+
+  "What would you improve next?"
+  → Resume paused clarification sessions (same session_id, not new POST).
+    Wire GET /api/bugbot/observations to admin UI.
+    Rate-limit / cache search results. Add unit tests for BugBot heuristics.
+
+
+================================================================================
+  SECTION 14 — KNOWN GAPS & GOTCHAS (read before demoing)
+================================================================================
+
+  1. Clarification resume starts NEW backend session (new UUID), not true graph
+     resume — frontend/src/App.jsx:43. Old session trace is separate.
+
+  2. esRef in App.jsx:28 is declared but never assigned — dead code.
+
+  3. GET /api/research/{session_id} exists but frontend doesn't use it.
+
+  4. DuckDuckGo can rate-limit; ddgs package may still return 0 intermittently.
+     Retriever has dual fallback (MCP → direct) to mitigate.
+
+  5. README.md still says "4-agent pipeline" — outdated; actual is 6 agents +
+     BugBot monitor. Update README when you have time.
+
+  6. docker-compose mcp-server healthcheck hits /health but mcp_server.py may
+     not expose that route — verify before Docker demo.
+
+
+================================================================================
+  SECTION 15 — QUICK COMMAND REFERENCE
+================================================================================
+
+  # Local dev (3 terminals)
+  cd backend && .venv/bin/python mcp_server.py
+  cd backend && set -a && source ../.env && set +a && \
+    MCP_SERVER_URL=http://localhost:8001/sse ENV=development .venv/bin/python main.py
+  cd frontend && npm run dev
+
+  # Docker
+  docker compose up --build
+
+  # Read BugBot log
+  tail -100 backend/logs/bugbot_observations.txt
+
+  # API health
+  curl http://localhost:8000/api/health
+
+================================================================================
+  END OF LIVING SPEC — remember to update Section 12 on every change
+================================================================================

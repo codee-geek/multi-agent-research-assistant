@@ -17,6 +17,15 @@ const AGENT_META = {
     border: 'border-emerald-800/40',
     badge: 'bg-emerald-900/60 text-emerald-300',
   },
+  evidence_validator: {
+    label: 'Evidence Validator',
+    icon: '✅',
+    color: 'from-cyan-500 to-sky-600',
+    ring: 'ring-cyan-500/30',
+    bg: 'bg-cyan-950/30',
+    border: 'border-cyan-800/40',
+    badge: 'bg-cyan-900/60 text-cyan-300',
+  },
   summarizer: {
     label: 'Synthesizer',
     icon: '📝',
@@ -34,6 +43,15 @@ const AGENT_META = {
     bg: 'bg-amber-950/30',
     border: 'border-amber-800/40',
     badge: 'bg-amber-900/60 text-amber-300',
+  },
+  self_review: {
+    label: 'Self-Review',
+    icon: '🔎',
+    color: 'from-rose-500 to-pink-600',
+    ring: 'ring-rose-500/30',
+    bg: 'bg-rose-950/30',
+    border: 'border-rose-800/40',
+    badge: 'bg-rose-900/60 text-rose-300',
   },
 }
 
@@ -108,6 +126,21 @@ function AgentCard({ agent, index }) {
 function AgentOutput({ agent, meta }) {
   const { output, name } = agent
 
+  if (name === 'planner' && output?.action === 'clarify') {
+    return (
+      <div className="mt-2 space-y-1">
+        <p className="text-xs text-amber-400/90">Asked for clarification before planning</p>
+        {output.ambiguities?.length > 0 && (
+          <div className="space-y-1">
+            {output.ambiguities.map((a, i) => (
+              <p key={i} className="text-xs text-gray-400">• {a}</p>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   if (name === 'planner' && output?.sub_queries) {
     return (
       <div className="mt-2 space-y-1">
@@ -145,6 +178,22 @@ function AgentOutput({ agent, meta }) {
     )
   }
 
+  if (name === 'evidence_validator' && output?.kept != null) {
+    return (
+      <div className="mt-2">
+        <p className="text-xs text-gray-400">
+          Kept <span className="text-white font-medium">{output.kept}</span>
+          {output.rejected > 0 && (
+            <>, rejected <span className="text-red-400 font-medium">{output.rejected}</span></>
+          )}
+        </p>
+        {(output.evidence_gaps ?? []).slice(0, 2).map((g, i) => (
+          <p key={i} className="text-xs text-gray-500 mt-1">Gap: {g.length > 70 ? g.slice(0, 70) + '…' : g}</p>
+        ))}
+      </div>
+    )
+  }
+
   if (name === 'summarizer' && output?.title) {
     return (
       <div className="mt-2">
@@ -165,6 +214,21 @@ function AgentOutput({ agent, meta }) {
       <div className="mt-2">
         <p className="text-xs text-gray-400">
           Formatted <span className="text-white font-medium">{output.citations.length} citations</span>
+        </p>
+      </div>
+    )
+  }
+
+  if (name === 'self_review' && output?.quality_score != null) {
+    return (
+      <div className="mt-2">
+        <p className="text-xs text-gray-400">
+          Quality score:{' '}
+          <span className={`font-medium ${output.quality_score >= 6 ? 'text-green-400' : 'text-red-400'}`}>
+            {output.quality_score.toFixed(1)}/10
+          </span>
+          {' · '}
+          {output.approved ? 'Approved' : 'Needs improvement'}
         </p>
       </div>
     )
